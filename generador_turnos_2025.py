@@ -148,6 +148,22 @@ shifts_coverage = {
     "23_4":[1,1,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1],
 }
 
+# --- 3. Selección de Turnos por el Usuario ------------------------------
+all_shifts = list(shifts_coverage.keys())
+select_all = st.checkbox("Seleccionar todos los turnos", value=True)
+if select_all:
+    selected = all_shifts
+else:
+    selected = st.multiselect(
+        "Selecciona los turnos que quieres incluir:",
+        options=all_shifts,
+        default=all_shifts
+    )
+if not selected:
+    st.error("Debes seleccionar al menos un turno para continuar.")
+    st.stop()
+# Filtrar shifts_coverage según selección
+shifts_coverage = {s: shifts_coverage[s] for s in selected}
 
 # --- FUNCIONES AUXILIARES ------------------------------------------------
 def adjust_required(dist):
@@ -159,7 +175,6 @@ def adjust_required(dist):
         out_off  = [math.ceil(r * (1 + OUT_OFF)) for r in base_adj]
         adj.append((in_off, out_off))
     return adj
-
 
 def build_scheduler(adj, seed):
     return MinAbsDifference(
@@ -174,7 +189,6 @@ def build_scheduler(adj, seed):
         random_seed=seed
     )
 
-
 def greedy_day_off_assignment(n_shifts, dist):
     result = []
     counts = np.zeros(7, int)
@@ -184,7 +198,6 @@ def greedy_day_off_assignment(n_shifts, dist):
         result.append(dias_semana[idx])
         counts[idx] += 1
     return result
-
 
 def coverage_pct(sol, dist):
     if sol['status'] not in ('OPTIMAL', 'FEASIBLE'):
@@ -203,7 +216,6 @@ def coverage_pct(sol, dist):
             diff_tot += abs(work - req)
     return (1 - diff_tot / req_tot) * 100
 
-
 def mutate_dist(base):
     noise = rng.normal(0, PERTURB_NOISE, 7)
     cand  = np.clip(base * (1 + noise), 1e-9, None)
@@ -218,23 +230,27 @@ def mutate_dist(base):
             return mutate_dist(base)
     return cand / cand.sum()
 
-
 def export_reports(sol, dist, tag):
     df_res = pd.DataFrame(sol['resources_shifts'])
     df_res.to_excel(f"Result_{tag}.xlsx", index=False)
     df_res.to_csv(f"Result_{tag}.csv", sep=';', index=False)
-    summary = (df_res.groupby('shift')
-               .agg(resources=('resources','sum'))
-               .reset_index())
+    summary = (
+        df_res.groupby('shift')
+              .agg(resources=('resources','sum'))
+              .reset_index()
+    )
     summary['Personal a Contratar'] = (summary['resources']/7).round().astype(int)
-    summary['Tipo de Contrato']     = summary['shift'].apply(lambda s: 'Full Time (8h)' if s.startswith('FT_') else 'Part Time (4h)')
-    summary['Día de Descanso']      = greedy_day_off_assignment(len(summary), dist)
-    summary['Refrigerio']            = summary.apply(
-        lambda r: f"Refrigerio {r['shift'].split('_')[-1]}" if r['Tipo de Contrato'].startswith('Full') else '-', axis=1)
+    summary['Tipo de Contrato']     = summary['shift'].apply(
+        lambda s: 'Full Time (8h)' if s.startswith('FT_') else 'Part Time (4h)'
+    )
+    summary['Día de Descanso'] = greedy_day_off_assignment(len(summary), dist)
+    summary['Refrigerio'] = summary.apply(
+        lambda r: f"Refrigerio {r['shift'].split('_')[-1]}" if r['Tipo de Contrato'].startswith('Full') else '-',
+        axis=1
+    )
     summary.rename(columns={'shift':'Horario'}, inplace=True)
     summary[['Horario','Tipo de Contrato','Personal a Contratar','Día de Descanso','Refrigerio']]
     summary.to_excel(f"Plan_Contratacion_{tag}.xlsx", index=False)
-
 # --- 5. BÚSQUEDA META-HEURÍSTICA --------------------------------------
 best_cov, best_sol, best_dist = -1, None, None
 iterator = range(MAX_ITER) if MAX_ITER is not None else itertools.count()
@@ -254,7 +270,6 @@ if best_sol:
     tag = time.strftime("%Y%m%d_%H%M%S")
     export_reports(best_sol, best_dist, tag)
     st.success(f"Reportes generados. Mejor cobertura: {best_cov:5.2f}%")
-    # Botones para descargar archivos
     files = [f for f in os.listdir('.') if tag in f]
     st.write("### Descarga tus reportes:")
     for fname in files:
@@ -267,5 +282,3 @@ if best_sol:
             )
 else:
     st.error("No se encontró solución factible.")
-
-
