@@ -5,35 +5,35 @@ import streamlit as st
 import pandas as pd, numpy as np, math, itertools, time, random
 from pyworkforce.scheduling import MinAbsDifference
 
-# Título de la app
+# --- UI: Título y carga de archivo -------------------------------------
 st.title("Generador de Turnos 2025")
-
-# Subida de archivo Excel
 uploaded = st.file_uploader("Sube tu archivo Excel (Requerido.xlsx)", type=["xlsx"])
 if not uploaded:
     st.warning("Por favor, sube el archivo Requerido.xlsx para continuar.")
     st.stop()
 
-# Lectura de datos
+# --- Leer datos ---------------------------------------------------------
 df = pd.read_excel(uploaded)
 
-# Parámetros de configuración
-MAX_ITER     = 300      # None = infinito hasta Ctrl+C
-TIME_SOLVER  = 120.0    # segundos por ejecución del solver
-SEED_START   = 0
-PERTURB_NOISE= 0.20     # 20% de ruido a la distribución base
-MIN_REST_PCT = 0.05     # cada día libre al menos 5%
+# --- Parámetros de configuración ---------------------------------------
+MAX_ITER      = 300      # None = infinito hasta Ctrl+C
+TIME_SOLVER   = 120.0    # segundos por ejecución del solver
+SEED_START    = 0       
+PERTURB_NOISE = 0.20     # 20% de ruido a la distribución base
+MIN_REST_PCT  = 0.05     # cada día libre al menos 5%
+IN_OFF        = 0.00    # % extra modalidad in-office
+OUT_OFF       = 0.00    # % extra modalidad out-office
 
-# Generador de números aleatorios reproducible
+# --- Inicializar RNG ---------------------------------------------------
 rng = np.random.default_rng(SEED_START)
 
-# 1. Demanda: extraer requeridos por día y periodo
+# --- 1. DEMANDA ---------------------------------------------------------
 required_resources = [[] for _ in range(7)]
 for _, r in df.iterrows():
     required_resources[int(r['Día'])-1].append(r['Suma de Agentes Requeridos Erlang'])
-assert all(len(d)==24 for d in required_resources), "Cada día debe tener 24 periodos"
+assert all(len(day) == 24 for day in required_resources), "Cada día debe tener 24 periodos"
 
-daily_demand   = [sum(d) for d in required_resources]
+daily_demand   = [sum(day) for day in required_resources]
 inv_weights    = [1 / max(1, x) for x in daily_demand]
 base_rest_dist = np.array(inv_weights) / sum(inv_weights)
 
@@ -149,20 +149,16 @@ shifts_coverage = {
 }
 
 
-# 3. Porcentajes in / out
-IN_OFF  = 0.00
-OUT_OFF = 0.00
-
-# Funciones auxiliares (adjust_required, build_scheduler, etc.)
+# --- FUNCIONES AUXILIARES ------------------------------------------------
 def adjust_required(dist):
-    ajustado = []
+    adj = []
     for i, day in enumerate(required_resources):
         factor   = 1 / (1 - dist[i])
-        adj_base = [math.ceil(r * factor) for r in day]
-        adj_in   = [math.ceil(r * (1 + IN_OFF)) for r in adj_base]
-        adj_out  = [math.ceil(r * (1 + OUT_OFF)) for r in adj_base]
-        ajustado.append((adj_in, adj_out))
-    return ajustado
+        base_adj = [math.ceil(r * factor) for r in day]
+        in_off   = [math.ceil(r * (1 + IN_OFF)) for r in base_adj]
+        out_off  = [math.ceil(r * (1 + OUT_OFF)) for r in base_adj]
+        adj.append((in_off, out_off))
+    return adj
 
 
 def build_scheduler(adj, seed):
@@ -178,30 +174,92 @@ def build_scheduler(adj, seed):
         random_seed=seed
     )
 
-# Aquí añade el resto de funciones coverage_pct, mutate_dist, export_reports, etc., sin cambios
-# ...
 
-# 5. Búsqueda meta-heurística
+def greedy_day_off_assignment(n_shifts, dist):
+    result = []
+    counts = np.zeros(7, int)
+    quota  = (n_shifts * dist).round().astype(int)
+    for _ in range(n_shifts):
+        idx = np.argmax(quota - counts)
+        result.append(dias_semana[idx])
+        counts[idx] += 1
+    return result
+
+
+def coverage_pct(sol, dist):
+    if sol['status'] not in ('OPTIMAL', 'FEASIBLE'):
+        return 0.0
+    shift_order = list(shifts_coverage.keys())
+    dayoff_map  = dict(zip(shift_order, greedy_day_off_assignment(len(shift_order), dist)))
+    diff_tot, req_tot = 0, sum(map(sum, required_resources))
+    for d, day_name in enumerate(dias_semana):
+        for h in range(24):
+            req = required_resources[d][h]
+            work = sum(
+                row['resources']
+                for row in sol['resources_shifts']
+                if row['day']==d and shifts_coverage[row['shift']][h] and dayoff_map[row['shift']]!=day_name
+            )
+            diff_tot += abs(work - req)
+    return (1 - diff_tot / req_tot) * 100
+
+
+def mutate_dist(base):
+    noise = rng.normal(0, PERTURB_NOISE, 7)
+    cand  = np.clip(base * (1 + noise), 1e-9, None)
+    cand /= cand.sum()
+    mask    = cand < MIN_REST_PCT
+    deficit = (MIN_REST_PCT - cand[mask]).sum()
+    cand[mask] = MIN_REST_PCT
+    if deficit > 0:
+        surplus = ~mask
+        cand[surplus] -= deficit / surplus.sum()
+        if (cand < 0).any():
+            return mutate_dist(base)
+    return cand / cand.sum()
+
+
+def export_reports(sol, dist, tag):
+    df_res = pd.DataFrame(sol['resources_shifts'])
+    df_res.to_excel(f"Result_{tag}.xlsx", index=False)
+    df_res.to_csv(f"Result_{tag}.csv", sep=';', index=False)
+    summary = df_res.groupby('shift').agg(resources=('resources','sum')).reset_index()
+    summary['Personal a Contratar'] = (summary['resources']/7).round().astype(int)
+    summary['Tipo de Contrato']     = summary['shift'].apply(lambda s: 'Full Time (8h)' if s.startswith('FT_') else 'Part Time (4h)')
+    summary['Día de Descanso'] = greedy_day_off_assignment(len(summary), dist)
+    summary['Refrigerio'] = summary.apply(lambda r: f"Refrigerio {r['shift'].split('_')[-1]}" if r['Tipo de Contrato'].startswith('Full') else '-', axis=1)
+    cols = ['shift','Tipo de Contrato','Personal a Contratar','Día de Descanso','Refrigerio']
+    summary.rename(columns={'shift':'Horario'}, inplace=True)
+    summary[['Horario','Tipo de Contrato','Personal a Contratar','Día de Descanso','Refrigerio']].to_excel(f"Plan_Contratacion_{tag}.xlsx", index=False)
+    total_agents = summary['Personal a Contratar'].sum()
+    descansos = (total_agents * dist).round().astype(int)
+    while descansos.sum() < total_agents:
+        descansos[np.argmin(descansos)] += 1
+    pd.DataFrame({'Día':dias_semana,'Personal Descansando':descansos,'Porcentaje':(dist*100).round(2),'Demanda del Día':daily_demand})\
+        .to_excel(f"Plan_Descansos_{tag}.xlsx", index=False)
+
+# --- 5. BÚSQUEDA META-HEURÍSTICA --------------------------------------
 best_cov, best_sol, best_dist = -1, None, None
-try:
-    iterator = itertools.count() if MAX_ITER is None else range(MAX_ITER)
-    for it in iterator:
-        dist = base_rest_dist.copy() if it==0 else mutate_dist(base_rest_dist)
-        adj  = adjust_required(dist)
-        sol  = build_scheduler(adj, SEED_START + it).solve()
-        cov  = coverage_pct(sol, dist)
-        if cov > best_cov:
-            best_cov, best_sol, best_dist = cov, sol, dist.copy()
-            print(f"[{it:03}] 🔹 NUEVO BEST {cov:5.2f}%  costo {sol['cost']}")
-        else:
-            print(f"[{it:03}] cobertura {cov:5.2f}%  (best {best_cov:5.2f}%)")
-except KeyboardInterrupt:
-    print("\n⏹  Detenido por el usuario")
+iterator = range(MAX_ITER) if MAX_ITER is not None else itertools.count()
+for it in iterator:
+    dist = base_rest_dist.copy() if it==0 else mutate_dist(base_rest_dist)
+    adj  = adjust_required(dist)
+    sol  = build_scheduler(adj, SEED_START+it).solve()
+    cov  = coverage_pct(sol, dist)
+    if cov > best_cov:
+        best_cov, best_sol, best_dist = cov, sol, dist.copy()
+        print(f"[{it:03}] 🔹 NUEVO BEST {cov:5.2f}%")
+    else:
+        print(f"[{it:03}] cobertura {cov:5.2f}% (best {best_cov:5.2f}%)")
 
-# 6. Exporta mejor resultado
+# --- 6. EXPORTA MEJOR RESULTADO ----------------------------------------
 if best_sol:
     tag = time.strftime("%Y%m%d_%H%M%S")
     export_reports(best_sol, best_dist, tag)
-    print(f"✅  Reportes generados con cobertura {best_cov:5.2f}%")
+    st.success(f"Reportes generados. Mejor cobertura: {best_cov:5.2f}%")
 else:
-    print("No se encontró solución factible.")
+    st.error("No se encontró solución factible.")
+
+
+
+
