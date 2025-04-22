@@ -16,7 +16,7 @@ if not uploaded:
 df = pd.read_excel(uploaded)
 
 # --- Parámetros de configuración ---------------------------------------
-MAX_ITER      = 300      # None = infinito hasta Ctrl+C
+MAX_ITER      = 20      # None = infinito hasta Ctrl+C
 TIME_SOLVER   = 120.0    # segundos por ejecución del solver
 SEED_START    = 0       
 PERTURB_NOISE = 0.20     # 20% de ruido a la distribución base
