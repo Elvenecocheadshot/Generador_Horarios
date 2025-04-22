@@ -2,7 +2,7 @@
 """Generador de Turnos 2025 con Streamlit"""
 
 import streamlit as st
-import pandas as pd, numpy as np, math, itertools, time, random
+import pandas as pd, numpy as np, math, itertools, time, random, os
 from pyworkforce.scheduling import MinAbsDifference
 
 # --- UI: Título y carga de archivo -------------------------------------
@@ -17,7 +17,7 @@ df = pd.read_excel(uploaded)
 
 # --- Parámetros de configuración ---------------------------------------
 MAX_ITER      = 20      # None = infinito hasta Ctrl+C
-TIME_SOLVER   = 120.0    # segundos por ejecución del solver
+TIME_SOLVER   = 120.0   # segundos por ejecución del solver
 SEED_START    = 0       
 PERTURB_NOISE = 0.20     # 20% de ruido a la distribución base
 MIN_REST_PCT  = 0.05     # cada día libre al menos 5%
@@ -223,20 +223,17 @@ def export_reports(sol, dist, tag):
     df_res = pd.DataFrame(sol['resources_shifts'])
     df_res.to_excel(f"Result_{tag}.xlsx", index=False)
     df_res.to_csv(f"Result_{tag}.csv", sep=';', index=False)
-    summary = df_res.groupby('shift').agg(resources=('resources','sum')).reset_index()
+    summary = (df_res.groupby('shift')
+               .agg(resources=('resources','sum'))
+               .reset_index())
     summary['Personal a Contratar'] = (summary['resources']/7).round().astype(int)
     summary['Tipo de Contrato']     = summary['shift'].apply(lambda s: 'Full Time (8h)' if s.startswith('FT_') else 'Part Time (4h)')
-    summary['Día de Descanso'] = greedy_day_off_assignment(len(summary), dist)
-    summary['Refrigerio'] = summary.apply(lambda r: f"Refrigerio {r['shift'].split('_')[-1]}" if r['Tipo de Contrato'].startswith('Full') else '-', axis=1)
-    cols = ['shift','Tipo de Contrato','Personal a Contratar','Día de Descanso','Refrigerio']
+    summary['Día de Descanso']      = greedy_day_off_assignment(len(summary), dist)
+    summary['Refrigerio']            = summary.apply(
+        lambda r: f"Refrigerio {r['shift'].split('_')[-1]}" if r['Tipo de Contrato'].startswith('Full') else '-', axis=1)
     summary.rename(columns={'shift':'Horario'}, inplace=True)
-    summary[['Horario','Tipo de Contrato','Personal a Contratar','Día de Descanso','Refrigerio']].to_excel(f"Plan_Contratacion_{tag}.xlsx", index=False)
-    total_agents = summary['Personal a Contratar'].sum()
-    descansos = (total_agents * dist).round().astype(int)
-    while descansos.sum() < total_agents:
-        descansos[np.argmin(descansos)] += 1
-    pd.DataFrame({'Día':dias_semana,'Personal Descansando':descansos,'Porcentaje':(dist*100).round(2),'Demanda del Día':daily_demand})\
-        .to_excel(f"Plan_Descansos_{tag}.xlsx", index=False)
+    summary[['Horario','Tipo de Contrato','Personal a Contratar','Día de Descanso','Refrigerio']]
+    summary.to_excel(f"Plan_Contratacion_{tag}.xlsx", index=False)
 
 # --- 5. BÚSQUEDA META-HEURÍSTICA --------------------------------------
 best_cov, best_sol, best_dist = -1, None, None
@@ -252,14 +249,23 @@ for it in iterator:
     else:
         print(f"[{it:03}] cobertura {cov:5.2f}% (best {best_cov:5.2f}%)")
 
-# --- 6. EXPORTA MEJOR RESULTADO ----------------------------------------
+# --- 6. EXPORTA MEJOR RESULTADO Y BOTONES DE DESCARGA -------------------
 if best_sol:
     tag = time.strftime("%Y%m%d_%H%M%S")
     export_reports(best_sol, best_dist, tag)
     st.success(f"Reportes generados. Mejor cobertura: {best_cov:5.2f}%")
+    # Botones para descargar archivos
+    files = [f for f in os.listdir('.') if tag in f]
+    st.write("### Descarga tus reportes:")
+    for fname in files:
+        with open(fname, 'rb') as file:
+            st.download_button(
+                label=fname,
+                data=file,
+                file_name=fname,
+                mime='application/octet-stream'
+            )
 else:
     st.error("No se encontró solución factible.")
-
-
 
 
