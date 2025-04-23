@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Forecast Multimodelo con Streamlit (con caché, logging y fallback WES)"""
+"""Forecast Multimodelo con Streamlit (con caché, logging y fallback WES robusto)"""
 
 import streamlit as st
 import pandas as pd
@@ -18,7 +18,7 @@ from sklearn.model_selection import GridSearchCV
 warnings.filterwarnings("ignore")
 st.set_page_config(layout="wide")
 
-# --- Cabecera de logs ---------------------------------------------------
+# --- Cabecera de logs ---
 log_container = st.sidebar.empty()
 def log(msg):
     log_container.text(msg)
@@ -26,7 +26,7 @@ def log(msg):
 st.title("Forecast Multimodelo con Streamlit")
 st.write("Usa la barra lateral para ver el progreso de cada etapa")
 
-# --- Funciones cacheadas ------------------------------------------------
+# --- Funciones cacheadas ---
 @st.cache_data(show_spinner=False)
 def load_df(uploaded_file):
     log("Cargando datos...")
@@ -80,13 +80,18 @@ def fit_sarima(series, seasonal, m):
 @st.cache_data(show_spinner=False)
 def fit_wes(series, m):
     log("Ajustando WES (Holt-Winters)...")
-    # Fallback si no hay suficientes datos para inicialización estacional
-    if m > 1 and len(series) < 2*m:
-        log("Datos insuficientes para WES estacional; usando fallback constante")
-        class Dummy:
-            def __init__(self, last): self.last = last
-            def forecast(self, steps): return np.repeat(self.last, steps)
-        return Dummy(series.iloc[-1])
+    nobs = len(series)
+    # requisitos mínimos: al menos 2*m observaciones y heurística necesita 10+2*(m//2)
+    min_obs = max(2*m, 10 + 2*(m//2)) if m>1 else 0
+    if m>1 and nobs < min_obs:
+        log(f"Datos insuficientes ({nobs} < {min_obs}) para WES estacional; usando WES sin estacionalidad")
+        model = ExponentialSmoothing(
+            series,
+            trend='add',
+            seasonal=None
+        ).fit()
+        log("WES fallback ajustado")
+        return model
     model = ExponentialSmoothing(
         series,
         seasonal='add',
@@ -122,7 +127,7 @@ def tune_xgb(X, y):
     log("XGBoost ajustado")
     return gs
 
-# --- Interfaz -----------------------------------------------------------
+# --- Interfaz ---
 with st.sidebar:
     uploaded = st.file_uploader("Sube tu archivo (Excel o CSV)", type=["xlsx","csv"])
     col_fecha = st.text_input("Columna de fecha", value=None)
@@ -132,7 +137,7 @@ with st.sidebar:
 if not uploaded or not col_fecha:
     st.stop()
 
-# --- Pipeline de ejecución ---------------------------------------------
+# --- Pipeline de ejecución ---
 raw = load_df(uploaded)
 if col_fecha not in raw.columns:
     st.error("Columna de fecha no encontrada en el archivo.")
@@ -164,30 +169,23 @@ if 'RandomForest' in select_ml:
 if 'XGBoost' in select_ml:
     xgb_model = tune_xgb(data_ml[['Mes','DiaDelAnio','Lag1','Lag2','MediaMovil3']], data_ml['Valor'])
 
-# --- Validación Walk-Forward -------------------------------------------
+# --- Validación Walk-Forward ---
 st.subheader("Validación Walk-Forward")
 progress = st.progress(0)
 pred_sarima, pred_wes = [], []
 history = train.copy()
 for i in range(len(test)):
-    try:
-        p_s = sarima_model.predict(n_periods=1)[0]
-    except:
-        p_s = history.iloc[-1]
-    try:
-        p_w = wes_model.forecast(1)[0]
-    except:
-        p_w = history.iloc[-1]
+    p_s = sarima_model.predict(n_periods=1)[0]
+    p_w = wes_model.forecast(1)[0]
     pred_sarima.append(p_s)
     pred_wes.append(p_w)
-    new_point = pd.Series([test.iloc[i]], index=[test.index[i]])
-    history = pd.concat([history, new_point])
+    history = pd.concat([history, pd.Series([test.iloc[i]], index=[test.index[i]])])
     progress.progress((i+1)/len(test))
 results = pd.DataFrame({'SARIMA': pred_sarima, 'WES': pred_wes}, index=test.index)
 st.line_chart(results)
 log("Walk-forward completado")
 
-# --- Forecast a futuro -------------------------------------------------
+# --- Forecast a futuro ---
 st.subheader("Forecast a futuro")
 with st.spinner("Generando pronóstico futuro..."):
     tonf = sarima_model.predict(n_periods=pasos)
@@ -196,21 +194,23 @@ with st.spinner("Generando pronóstico futuro..."):
 fdates = pd.date_range(start=series.index[-1]+pd.tseries.frequencies.to_offset(freq), periods=pasos, freq=freq)
 ml_preds = {}
 if rf_model:
-    ml_preds['RF'] = rf_model.predict(pd.DataFrame({
+    Xf = pd.DataFrame({
         'Mes': fdates.month,
         'DiaDelAnio': fdates.dayofyear,
         'Lag1': series.iloc[-1],
         'Lag2': series.iloc[-2] if len(series)>1 else series.iloc[-1],
         'MediaMovil3': series.iloc[-3:].mean() if len(series)>=3 else series.iloc[-1]
-    }, index=fdates))
+    }, index=fdates)
+    ml_preds['RF'] = rf_model.predict(Xf)
 if xgb_model:
-    ml_preds['XGB'] = xgb_model.predict(pd.DataFrame({
+    Xf = pd.DataFrame({
         'Mes': fdates.month,
         'DiaDelAnio': fdates.dayofyear,
         'Lag1': series.iloc[-1],
         'Lag2': series.iloc[-2] if len(series)>1 else series.iloc[-1],
         'MediaMovil3': series.iloc[-3:].mean() if len(series)>=3 else series.iloc[-1]
-    }, index=fdates))
+    }, index=fdates)
+    ml_preds['XGB'] = xgb_model.predict(Xf)
 
 stack_df = pd.DataFrame({'SARIMA': tonf, 'WES': wesf, **ml_preds}, index=fdates)
 ridge = Ridge().fit(stack_df.fillna(method='ffill'), np.zeros(len(stack_df)))
@@ -218,7 +218,7 @@ stack_df['Stack'] = ridge.predict(stack_df.fillna(method='ffill'))
 st.line_chart(stack_df)
 log("Forecast completado")
 
-# --- Descarga de resultados --------------------------------------------
+# --- Descarga de resultados ---
 buf = BytesIO()
 with pd.ExcelWriter(buf, engine='openpyxl') as writer:
     results.to_excel(writer, sheet_name='WFV')
